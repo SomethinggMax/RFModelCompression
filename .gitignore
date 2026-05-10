@@ -1,0 +1,44 @@
+# Dataset and large binaries — never commit
+/dataset/
+**/dataset/
+*.pkl
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+
+# Local cache produced by the preprocessing pipeline
+cache/
+**/cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# uv
+.uv/
+uv.lock.bak
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Notebook
+.ipynb_checkpoints/
+
+# Experiment tracking
+runs/
+wandb/
+tensorboard/
+logs/
+
+# Generated artefacts allowed back in only when explicit
+*.gif
+*.mp4
