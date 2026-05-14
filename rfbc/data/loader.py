@@ -7,6 +7,7 @@ in the format ``[timestamp, x, y, z, density]`` (Zuo et al. 2025).
 from __future__ import annotations
 
 import pickle
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -14,6 +15,15 @@ from typing import Sequence
 import numpy as np
 
 from rfbc.config import RADAR_ROOT
+
+
+# The RF-Behavior .pkl files were created under an older NumPy where
+# ``align=0`` was an acceptable dtype kwarg. NumPy 2.4+ raises a
+# VisibleDeprecationWarning every time we unpickle one. The files themselves
+# are still well-formed — once unpickled, the resulting arrays are normal —
+# so we silence that one specific warning at load time. We narrow the filter
+# to just this message so genuinely useful deprecation warnings still surface.
+_PKL_ALIGN_WARNING_MSG = r"dtype\(\): align should be passed"
 
 
 @dataclass
@@ -41,7 +51,12 @@ def load_sensor(path: Path | str) -> list[np.ndarray]:
     sensor/sample combinations because of dataset sparsity).
     """
     path = Path(path)
-    with path.open("rb") as f:
+    with path.open("rb") as f, warnings.catch_warnings():
+        # Filter on the message text only — the warning class moved between
+        # NumPy versions (was np.VisibleDeprecationWarning, now lives at
+        # np.exceptions.VisibleDeprecationWarning) so importing it portably
+        # is more pain than it's worth.
+        warnings.filterwarnings("ignore", message=_PKL_ALIGN_WARNING_MSG)
         data = pickle.load(f)
     cleaned: list[np.ndarray] = []
     for frame in data:
