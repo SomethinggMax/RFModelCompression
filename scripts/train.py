@@ -58,7 +58,7 @@ from rfbc.config import DEFAULT_CONFIG, PipelineConfig
 from rfbc.data.dataset import SubjectIndependentRadarDataset
 from rfbc.data.splits import Split, load_split
 from rfbc.data.two_head import TwoHeadRadarDataset, make_two_head_sampler
-from rfbc.models.baseline_cnn import TwoHeadCNN
+from rfbc.models.two_head_cnn import TwoHeadCNN
 
 
 # ---------------------------------------------------------------------------

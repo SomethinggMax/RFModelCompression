@@ -1,20 +1,50 @@
-"""Two-head baseline CNN for joint C1 + C2 prediction.
+"""Single-head baseline CNN — the compression study's starting point.
 
-Shared backbone:
-    - 1x1 stem to compress the wide channel dimension (~486 in the default
-      pipeline) down to something the spatial convs can chew on.
-    - 3 conv blocks (Conv -> BN -> ReLU -> MaxPool) doubling channels each
-      time and halving spatial dims (64 -> 32 -> 16 -> 8).
-    - Global average pool + dropout.
+Architecture (≈ 420 K parameters):
 
-Two heads:
-    - ``head_c1``: 21-way classifier for Campaign 1 gestures (M01..M21).
-    - ``head_c2``: 10-way classifier for Campaign 2 activities (A01..A10).
+    Input   (B, 486, 64, 64)   ← BEV tensor from the standard pipeline
+    Stem    Conv1×1(486→32)  + BN + ReLU        (B,  32, 64, 64)
+    Block1  Conv3×3(32→32)   + BN + ReLU + Pool  (B,  32, 32, 32)
+    Block2  Conv3×3(32→64)   + BN + ReLU + Pool  (B,  64, 16, 16)
+    Block3  Conv3×3(64→128)  + BN + ReLU + Pool  (B, 128,  8,  8)
+    Block4  Conv3×3(128→256) + BN + ReLU         (B, 256,  8,  8)
+    GlobalAvgPool                                (B, 256)
+    Dropout(0.5)
+    Linear(256 → 31)                             logits over 31 classes
 
-At forward time the network always returns both heads' logits; the training
-loop is responsible for routing each sample's loss to the correct head based
-on its campaign. Total params are well under 200 K so this is genuinely a
-"small CNN for demo" and not a real baseline.
+Design decisions
+----------------
+Standard ops only (Conv2d / BatchNorm2d / ReLU / MaxPool2d / Linear).
+Both magnitude-based filter pruning and post-training quantisation (PTQ)
+interact cleanly with this op set. Conv→BN→ReLU triples fold into a single
+quantised op; MaxPool is quantisation-transparent; no exotic activations
+or normalisation layers require special casing.
+
+No skip connections. Filter-level structured pruning stays unambiguous:
+pruning the output channels of block N only requires patching the input
+channels of block N+1. There is no residual add to keep consistent.
+
+Single head, 31 classes (21 C1 micro-gestures M01–M21 + 10 C2 macro-
+activities A01–A10). Campaign membership is determined post-hoc by label
+index (C1 labels come first in the label_map because campaigns=("C1","C2")
+in the default config). This lets the compression analysis ask directly:
+do the 21 fine-grained gesture classes degrade faster than the 10 coarse
+activity classes under the same pruning budget?
+
+Block4 carries no MaxPool. After three halvings the feature map is already
+8×8; another halving to 4×4 would lose spatial structure before the global
+pool rather than refine it. Block4 instead acts as a feature-refinement
+stage at fixed resolution.
+
+Dropout 0.5. The two-head demo showed a ~20-point train/val gap on C1 even
+at 121 K params; with 420 K params and the harder 31-class problem stronger
+regularisation is warranted. Reduce only if val accuracy is visibly below
+train in a way that looks like under-fitting rather than over-fitting.
+
+Compression helpers. ``prunable_conv_layers`` returns an ordered dict of
+every Conv2d in forward-pass order. ``features()`` exposes the post-pool
+representation without the classifier, useful for probing representations
+before and after compression.
 """
 
 from __future__ import annotations
@@ -23,67 +53,82 @@ import torch
 import torch.nn as nn
 
 
-class TwoHeadCNN(nn.Module):
-    """Small two-head CNN over the (C, 64, 64) BEV tensor.
+class BaselineCNN(nn.Module):
+    """Single-head 31-class CNN baseline for the compression study.
 
     Parameters
     ----------
     in_channels
-        Number of input channels (e.g. 486 for the default pipeline).
-    num_c1_classes
-        Number of Campaign 1 gesture classes. Default 21 (M01..M21).
-    num_c2_classes
-        Number of Campaign 2 activity classes. Default 10 (A01..A10).
-    stem_channels
-        Channels after the 1x1 stem. The default of 32 brings 486 down by a
-        factor of ~15 — enough to keep early conv parameter counts modest.
-    base_width
-        Channels in the first conv block. Doubles each block.
+        Number of BEV input channels. Default 486 = 54 frames × 3 z-bands
+        × 3 features/cell, matching the standard pipeline config.
+    num_classes
+        Output classes. Default 31 = 21 C1 gestures + 10 C2 activities.
     dropout
-        Dropout probability applied before the linear heads.
+        Dropout probability applied immediately before the linear head.
+        Default 0.5.
     """
 
     def __init__(
         self,
-        in_channels: int,
-        num_c1_classes: int = 21,
-        num_c2_classes: int = 10,
-        stem_channels: int = 32,
-        base_width: int = 32,
-        dropout: float = 0.3,
+        in_channels: int = 486,
+        num_classes: int = 31,
+        dropout: float = 0.5,
     ) -> None:
         super().__init__()
-        # 1x1 channel-compression stem: turns (B, 486, 64, 64) into
-        # (B, stem_channels, 64, 64) so the spatial convs see a reasonable
-        # channel count.
+
+        # ------------------------------------------------------------------
+        # Stem: 1×1 conv collapses the wide temporal-feature channel
+        # dimension to 32 before the spatial convolutions start.
+        # Keeping the stem separate makes it an addressable pruning target
+        # independent of the spatial blocks.
+        # ------------------------------------------------------------------
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, stem_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(stem_channels),
+            nn.Conv2d(in_channels, 32, kernel_size=1, bias=False),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
 
-        self.backbone = nn.Sequential(
-            self._conv_block(stem_channels, base_width),         # 64 -> 32
-            self._conv_block(base_width, base_width * 2),        # 32 -> 16
-            self._conv_block(base_width * 2, base_width * 4),    # 16 -> 8
-            nn.AdaptiveAvgPool2d(1),                             # 8 -> 1
+        # ------------------------------------------------------------------
+        # Spatial backbone — four named blocks.
+        # Blocks 1–3 halve spatial resolution via MaxPool.
+        # Block 4 refines features at 8×8 without further downsampling.
+        # ------------------------------------------------------------------
+        self.block1 = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),        # 64×64 → 32×32
+        )
+        self.block2 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),        # 32×32 → 16×16
+        )
+        self.block3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),        # 16×16 → 8×8
+        )
+        self.block4 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),  # stays at 8×8 — no MaxPool
         )
 
-        feat_dim = base_width * 4
+        # ------------------------------------------------------------------
+        # Classifier head
+        # ------------------------------------------------------------------
+        self.pool = nn.AdaptiveAvgPool2d(1)
         self.dropout = nn.Dropout(dropout)
-        self.head_c1 = nn.Linear(feat_dim, num_c1_classes)
-        self.head_c2 = nn.Linear(feat_dim, num_c2_classes)
+        self.classifier = nn.Linear(256, num_classes)
 
         self._init_weights()
 
-    @staticmethod
-    def _conv_block(in_c: int, out_c: int) -> nn.Sequential:
-        return nn.Sequential(
-            nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-        )
+    # ------------------------------------------------------------------
+    # Weight initialisation
+    # ------------------------------------------------------------------
 
     def _init_weights(self) -> None:
         for m in self.modules():
@@ -96,23 +141,78 @@ class TwoHeadCNN(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="linear")
                 nn.init.zeros_(m.bias)
 
+    # ------------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------------
+
     def features(self, x: torch.Tensor) -> torch.Tensor:
-        """Run the shared backbone, return the post-pool feature vector."""
-        h = self.stem(x)
-        h = self.backbone(h)
-        return torch.flatten(h, 1)
+        """Backbone only — returns the 256-d post-pool feature vector.
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(c1_logits, c2_logits)`` for every sample in the batch.
-
-        Routing each sample to its correct head is the training loop's job —
-        the forward pass is campaign-agnostic so the same call works at
-        training, validation, and inference time.
+        Use this during compression analysis to probe representations
+        before/after pruning without passing through the classifier, or
+        to attach a fresh linear head after compression.
         """
-        feat = self.features(x)
-        feat = self.dropout(feat)
-        return self.head_c1(feat), self.head_c2(feat)
+        x = self.stem(x)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+        x = self.pool(x)
+        return torch.flatten(x, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.dropout(self.features(x)))
+
+    # ------------------------------------------------------------------
+    # Compression helpers
+    # ------------------------------------------------------------------
 
     @property
     def num_parameters(self) -> int:
+        """Total trainable parameter count."""
         return sum(p.numel() for p in self.parameters())
+
+    @property
+    def prunable_conv_layers(self) -> dict[str, nn.Conv2d]:
+        """Ordered {name: module} dict of every Conv2d in forward-pass order.
+
+        Use this when implementing structured filter pruning. The chain is:
+
+            stem.0  →  block1.0  →  block2.0  →  block3.0  →  block4.0
+
+        Pruning the output channels of layer N requires matching the input
+        channels of layer N+1 in this sequence. There are no skip connections
+        so the dependency chain is strictly linear.
+        """
+        return {
+            name: module
+            for name, module in self.named_modules()
+            if isinstance(module, nn.Conv2d)
+        }
+
+    def layer_parameter_counts(self) -> dict[str, int]:
+        """Parameter count per named top-level module.
+
+        Useful for understanding which blocks dominate the budget before
+        deciding where to focus a pruning sweep.
+
+        Example output (default config)::
+
+            stem:        15 616   ( 3.7 %)
+            block1:       9 280   ( 2.2 %)
+            block2:      18 560   ( 4.4 %)
+            block3:      73 984   (17.6 %)
+            block4:     295 424   (70.3 %)   ← dominates; prune here first
+            classifier:   7 967   ( 1.9 %)
+        """
+        return {
+            name: sum(p.numel() for p in mod.parameters())
+            for name, mod in [
+                ("stem",       self.stem),
+                ("block1",     self.block1),
+                ("block2",     self.block2),
+                ("block3",     self.block3),
+                ("block4",     self.block4),
+                ("classifier", self.classifier),
+            ]
+        }
