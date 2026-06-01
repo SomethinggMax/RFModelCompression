@@ -21,8 +21,16 @@ dev = [
 ]
 
 [tool.uv]
-# Pin index for CPU/CUDA torch wheels in environments where the default index
-# does not provide them. Override with --index-url at install time if needed.
+# Tell uv to fetch torch from the PyTorch cu124 index instead of PyPI.
+# cu124 wheels work on any server whose NVIDIA driver supports CUDA ≤ 12.5
+# (driver internal version ≤ 12050). Run `uv sync` after pulling this change.
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
 
 [tool.setuptools.packages.find]
 where = ["."]

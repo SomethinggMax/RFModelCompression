@@ -1,0 +1,230 @@
+{
+  "seed": 42,
+  "overall_acc": 0.8985446985446985,
+  "overall_n": 2405,
+  "c1_acc": 0.8250478011472275,
+  "c2_acc": 0.9551140544518028,
+  "per_class": {
+    "C1": [
+      {
+        "class": "M01",
+        "label": 0,
+        "correct": 43,
+        "total": 46,
+        "acc": 0.9347826086956522
+      },
+      {
+        "class": "M02",
+        "label": 1,
+        "correct": 56,
+        "total": 58,
+        "acc": 0.9655172413793104
+      },
+      {
+        "class": "M03",
+        "label": 2,
+        "correct": 57,
+        "total": 60,
+        "acc": 0.95
+      },
+      {
+        "class": "M04",
+        "label": 3,
+        "correct": 31,
+        "total": 48,
+        "acc": 0.6458333333333334
+      },
+      {
+        "class": "M05",
+        "label": 4,
+        "correct": 24,
+        "total": 35,
+        "acc": 0.6857142857142857
+      },
+      {
+        "class": "M06",
+        "label": 5,
+        "correct": 31,
+        "total": 37,
+        "acc": 0.8378378378378378
+      },
+      {
+        "class": "M07",
+        "label": 6,
+        "correct": 46,
+        "total": 49,
+        "acc": 0.9387755102040817
+      },
+      {
+        "class": "M08",
+        "label": 7,
+        "correct": 31,
+        "total": 40,
+        "acc": 0.775
+      },
+      {
+        "class": "M09",
+        "label": 8,
+        "correct": 25,
+        "total": 35,
+        "acc": 0.7142857142857143
+      },
+      {
+        "class": "M10",
+        "label": 9,
+        "correct": 83,
+        "total": 84,
+        "acc": 0.9880952380952381
+      },
+      {
+        "class": "M11",
+        "label": 10,
+        "correct": 17,
+        "total": 34,
+        "acc": 0.5
+      },
+      {
+        "class": "M12",
+        "label": 11,
+        "correct": 26,
+        "total": 34,
+        "acc": 0.7647058823529411
+      },
+      {
+        "class": "M13",
+        "label": 12,
+        "correct": 33,
+        "total": 39,
+        "acc": 0.8461538461538461
+      },
+      {
+        "class": "M14",
+        "label": 13,
+        "correct": 38,
+        "total": 38,
+        "acc": 1.0
+      },
+      {
+        "class": "M15",
+        "label": 14,
+        "correct": 58,
+        "total": 63,
+        "acc": 0.9206349206349206
+      },
+      {
+        "class": "M16",
+        "label": 15,
+        "correct": 38,
+        "total": 62,
+        "acc": 0.6129032258064516
+      },
+      {
+        "class": "M17",
+        "label": 16,
+        "correct": 46,
+        "total": 56,
+        "acc": 0.8214285714285714
+      },
+      {
+        "class": "M18",
+        "label": 17,
+        "correct": 58,
+        "total": 63,
+        "acc": 0.9206349206349206
+      },
+      {
+        "class": "M19",
+        "label": 18,
+        "correct": 32,
+        "total": 35,
+        "acc": 0.9142857142857143
+      },
+      {
+        "class": "M20",
+        "label": 19,
+        "correct": 36,
+        "total": 64,
+        "acc": 0.5625
+      },
+      {
+        "class": "M21",
+        "label": 20,
+        "correct": 54,
+        "total": 66,
+        "acc": 0.8181818181818182
+      }
+    ],
+    "C2": [
+      {
+        "class": "A01",
+        "label": 21,
+        "correct": 562,
+        "total": 571,
+        "acc": 0.9842381786339754
+      },
+      {
+        "class": "A02",
+        "label": 22,
+        "correct": 268,
+        "total": 292,
+        "acc": 0.9178082191780822
+      },
+      {
+        "class": "A03",
+        "label": 23,
+        "correct": 90,
+        "total": 95,
+        "acc": 0.9473684210526315
+      },
+      {
+        "class": "A04",
+        "label": 24,
+        "correct": 57,
+        "total": 57,
+        "acc": 1.0
+      },
+      {
+        "class": "A05",
+        "label": 25,
+        "correct": 108,
+        "total": 108,
+        "acc": 1.0
+      },
+      {
+        "class": "A06",
+        "label": 26,
+        "correct": 92,
+        "total": 92,
+        "acc": 1.0
+      },
+      {
+        "class": "A07",
+        "label": 27,
+        "correct": 34,
+        "total": 40,
+        "acc": 0.85
+      },
+      {
+        "class": "A08",
+        "label": 28,
+        "correct": 28,
+        "total": 37,
+        "acc": 0.7567567567567568
+      },
+      {
+        "class": "A09",
+        "label": 29,
+        "correct": 29,
+        "total": 34,
+        "acc": 0.8529411764705882
+      },
+      {
+        "class": "A10",
+        "label": 30,
+        "correct": 30,
+        "total": 33,
+        "acc": 0.9090909090909091
+      }
+    ]
+  }
+}
