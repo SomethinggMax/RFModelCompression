@@ -70,6 +70,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from rfbc.config import DEFAULT_CONFIG, PipelineConfig
+from rfbc.data.augment import AugmentedView, make_bev_augment
 from rfbc.data.combined import CombinedRadarDataset, make_combined_sampler
 from rfbc.data.dataset import SubjectIndependentRadarDataset
 from rfbc.data.splits import Split, load_split
@@ -105,9 +106,37 @@ def parse_args() -> argparse.Namespace:
                         "converge (the two-head demo was still climbing at epoch 20).")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-4,
+                   help="AdamW weight decay. Default 1e-4; try 5e-4 or 1e-3 to "
+                        "regularise harder against the observed over-fitting.")
     p.add_argument("--dropout", type=float, default=0.5,
                    help="Dropout probability before the linear head. Default 0.5.")
+
+    # --- anti-over-fitting knobs (all default to the original behaviour) ---
+    p.add_argument("--label-smoothing", type=float, default=0.0,
+                   help="Cross-entropy label smoothing on the TRAIN loss only. "
+                        "0.0 = off (original). Try 0.05–0.1 to curb the "
+                        "train-loss→0 over-confidence. Val/test loss stays "
+                        "unsmoothed for comparability.")
+    p.add_argument("--augment", action="store_true",
+                   help="Enable on-the-fly BEV augmentation on the train fold "
+                        "(translation, small rotation, frame dropout, density "
+                        "noise, cutout). No mirror flips — chirality. Off by "
+                        "default to preserve the original run.")
+    p.add_argument("--aug-strength", type=float, default=1.0,
+                   help="Global multiplier on augmentation firing probabilities "
+                        "(0–1). Only used with --augment. Default 1.0.")
+    p.add_argument("--early-stop-patience", type=int, default=0,
+                   help="Stop if val accuracy hasn't improved for this many "
+                        "epochs. 0 = disabled (train all epochs, original "
+                        "behaviour). Try 8–10.")
+    p.add_argument("--width-mult", type=float, default=1.0,
+                   help="BaselineCNN channel-width multiplier. 1.0 = original "
+                        "~420 K-param model; 0.5 ≈ a quarter of the params "
+                        "(less capacity to memorise).")
+    p.add_argument("--conv-dropout", type=float, default=0.0,
+                   help="Dropout2d probability after each conv block. 0.0 = off "
+                        "(original). Try 0.1–0.2.")
     p.add_argument("--num-workers", type=int, default=0,
                    help="DataLoader workers. Keep 0 on Windows to avoid pickling "
                         "issues when the cache is being built for the first time.")
@@ -158,6 +187,7 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str,
+    label_smoothing: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -169,7 +199,9 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True)
 
         logits = model(x)
-        loss = F.cross_entropy(logits, labels, reduction="mean")
+        loss = F.cross_entropy(
+            logits, labels, reduction="mean", label_smoothing=label_smoothing,
+        )
 
         optimizer.zero_grad()
         loss.backward()
@@ -450,8 +482,18 @@ def run_one_seed(
     # DataLoaders
     # ------------------------------------------------------------------
     sampler = make_combined_sampler(train_ds)
+    # Wrap the *train* dataset with on-the-fly augmentation when requested.
+    # The sampler is built over the unwrapped CombinedRadarDataset above; the
+    # AugmentedView shares its index space, so the sampler stays valid.
+    if getattr(args, "augment", False):
+        augment = make_bev_augment(cfg, strength=args.aug_strength)
+        train_view: object = AugmentedView(train_ds, augment)
+        print(f"  Augmentation: ON (strength={args.aug_strength})")
+    else:
+        train_view = train_ds
+        print("  Augmentation: OFF")
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size,
+        train_view, batch_size=args.batch_size,
         sampler=sampler, num_workers=args.num_workers,
         drop_last=False,
     )
@@ -475,11 +517,14 @@ def run_one_seed(
         in_channels=in_channels,
         num_classes=num_classes,
         dropout=args.dropout,
+        width_mult=args.width_mult,
+        conv_dropout=args.conv_dropout,
     ).to(args.device)
 
     print(f"\n  Model: BaselineCNN  {model.num_parameters:,} parameters")
     print(f"  in_channels={in_channels}  num_classes={num_classes}  "
-          f"dropout={args.dropout}")
+          f"dropout={args.dropout}  width_mult={args.width_mult}  "
+          f"conv_dropout={args.conv_dropout}")
     counts = model.layer_parameter_counts()
     total  = model.num_parameters
     for layer, cnt in counts.items():
@@ -497,6 +542,7 @@ def run_one_seed(
     # ------------------------------------------------------------------
     log_rows: list[dict] = []
     best_val_acc = -1.0
+    epochs_since_improve = 0
     best_ckpt = seed_dir / "model.pt"
 
     epoch_fmt = (
@@ -510,7 +556,10 @@ def run_one_seed(
 
     for ep in range(1, args.epochs + 1):
         t0 = time.time()
-        train_m = train_one_epoch(model, train_loader, optimizer, args.device)
+        train_m = train_one_epoch(
+            model, train_loader, optimizer, args.device,
+            label_smoothing=args.label_smoothing,
+        )
         val_m   = evaluate(model, val_loader, args.device)
         scheduler.step()
         dt = time.time() - t0
@@ -530,19 +579,24 @@ def run_one_seed(
             "train_acc":  train_m["acc"],
             "val_loss":   val_m["loss"],
             "val_acc":    val_m["acc"],
+            # train-minus-val accuracy gap: the headline over-fitting metric.
+            "gap":        train_m["acc"] - val_m["acc"],
             "epoch_secs": dt,
         }
         log_rows.append(row)
 
         if val_m["acc"] > best_val_acc:
             best_val_acc = val_m["acc"]
+            epochs_since_improve = 0
             torch.save({
                 # Everything needed to reconstruct the model for compression.
                 "state_dict": model.state_dict(),
                 "arch": {
-                    "in_channels": in_channels,
+                    "in_channels":  in_channels,
                     "num_classes":  num_classes,
                     "dropout":      args.dropout,
+                    "width_mult":   args.width_mult,
+                    "conv_dropout": args.conv_dropout,
                 },
                 "label_map": {
                     "c1_classes":    list(train_ds.c1_classes),
@@ -559,6 +613,15 @@ def run_one_seed(
                     "weight_decay": args.weight_decay,
                 },
             }, best_ckpt)
+        else:
+            epochs_since_improve += 1
+
+        if (args.early_stop_patience > 0
+                and epochs_since_improve >= args.early_stop_patience):
+            print(f"  Early stopping at epoch {ep} (no val-acc improvement for "
+                  f"{epochs_since_improve} epochs; best val acc="
+                  f"{best_val_acc:.3f}).", flush=True)
+            break
 
     # ------------------------------------------------------------------
     # Save training log + curves

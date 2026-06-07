@@ -66,6 +66,17 @@ class BaselineCNN(nn.Module):
     dropout
         Dropout probability applied immediately before the linear head.
         Default 0.5.
+    width_mult
+        Channel-width multiplier for the whole backbone. ``1.0`` reproduces the
+        original 32/32/64/128/256 architecture exactly (~420 K params). Values
+        below 1.0 shrink capacity, a cheap lever against over-fitting and a
+        cleaner starting point for the compression study (e.g. ``0.5`` ≈ a
+        quarter of the parameters). Channel counts are rounded and floored at 8.
+    conv_dropout
+        Probability for ``Dropout2d`` (spatial dropout) applied after each
+        backbone block. ``0.0`` (default) is a no-op, preserving the original
+        behaviour. Small values (0.1–0.2) regularise the convolutional stack in
+        addition to the head dropout.
     """
 
     def __init__(
@@ -73,8 +84,21 @@ class BaselineCNN(nn.Module):
         in_channels: int = 486,
         num_classes: int = 31,
         dropout: float = 0.5,
+        width_mult: float = 1.0,
+        conv_dropout: float = 0.0,
     ) -> None:
         super().__init__()
+
+        self.width_mult = width_mult
+        self.conv_dropout_p = conv_dropout
+
+        def _w(base: int) -> int:
+            return max(8, int(round(base * width_mult)))
+
+        c1, c2, c3, c4 = _w(32), _w(64), _w(128), _w(256)
+        # Stem width tracks the first spatial block so width_mult=1.0 keeps the
+        # original 32-channel stem.
+        c_stem = _w(32)
 
         # ------------------------------------------------------------------
         # Stem: 1×1 conv collapses the wide temporal-feature channel
@@ -83,8 +107,8 @@ class BaselineCNN(nn.Module):
         # independent of the spatial blocks.
         # ------------------------------------------------------------------
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(in_channels, c_stem, kernel_size=1, bias=False),
+            nn.BatchNorm2d(c_stem),
             nn.ReLU(inplace=True),
         )
 
@@ -94,35 +118,38 @@ class BaselineCNN(nn.Module):
         # Block 4 refines features at 8×8 without further downsampling.
         # ------------------------------------------------------------------
         self.block1 = nn.Sequential(
-            nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(c_stem, c1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c1),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2),        # 64×64 → 32×32
         )
         self.block2 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(c1, c2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c2),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2),        # 32×32 → 16×16
         )
         self.block3 = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(c2, c3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c3),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2),        # 16×16 → 8×8
         )
         self.block4 = nn.Sequential(
-            nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(c3, c4, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c4),
             nn.ReLU(inplace=True),  # stays at 8×8 — no MaxPool
         )
+
+        # Spatial dropout applied after each block (no-op when conv_dropout=0).
+        self.conv_dropout = nn.Dropout2d(conv_dropout)
 
         # ------------------------------------------------------------------
         # Classifier head
         # ------------------------------------------------------------------
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(256, num_classes)
+        self.classifier = nn.Linear(c4, num_classes)
 
         self._init_weights()
 
@@ -153,10 +180,10 @@ class BaselineCNN(nn.Module):
         to attach a fresh linear head after compression.
         """
         x = self.stem(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
+        x = self.conv_dropout(self.block1(x))
+        x = self.conv_dropout(self.block2(x))
+        x = self.conv_dropout(self.block3(x))
+        x = self.conv_dropout(self.block4(x))
         x = self.pool(x)
         return torch.flatten(x, 1)
 
