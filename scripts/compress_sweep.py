@@ -23,19 +23,33 @@ Per-class test accuracy is saved for each (seed, config), then aggregated into
 a cross-seed summary (median ± std per class, macro-averaged campaign accuracy,
 and deltas versus the baseline).
 
+There are two evaluation protocols:
+
+* **Single split** (default): compresses ``outputs/baseline/seed_{N}/model.pt``
+  and evaluates on the one locked split. Error bars come from seeds only.
+* **Cross-validation** (``--cv``): compresses every ``outputs/cv/fold_k/
+  seed_S/model.pt`` and evaluates each on its own held-out fold, aggregating
+  across folds x seeds. Error bars then carry subject variation too, matching
+  the CV baseline. This is the recommended protocol for the thesis.
+
 Usage (run from the ``code/`` directory)
 -----------------------------------------
-    uv run python -m scripts.compress_sweep                  # full sweep, 3 seeds
-    uv run python -m scripts.compress_sweep --seeds 42       # single seed
+    uv run python -m scripts.compress_sweep                  # single split, 3 seeds
     uv run python -m scripts.compress_sweep --quick          # tiny wiring check
     uv run python -m scripts.compress_sweep --skip-quant     # pruning only
 
-Output (saved to ``code/outputs/compression/``)
------------------------------------------------
-    seed_{N}/
-        results.json            every config's overall + per-class accuracy
-    summary.json                cross-seed aggregation + deltas vs baseline
-    degradation_curves.png      macro-avg C1/C2 accuracy vs sparsity
+    uv run python -m scripts.compress_sweep --cv             # CV: all folds x seeds
+    uv run python -m scripts.compress_sweep --cv --quick     # CV wiring check (fold 0)
+    uv run python -m scripts.compress_sweep --cv --skip-quant  # CV, pruning only
+
+Output
+------
+    Single split -> ``code/outputs/compression/``
+    CV (--cv)    -> ``code/outputs/compression_cv/``
+        seed_{N}/ or fold_{k}/seed_{S}/
+            results.json        every config's overall + per-class accuracy
+        summary.json            aggregation across runs + deltas vs baseline
+        degradation_curves.png  macro-avg C1/C2 accuracy vs sparsity
 """
 
 from __future__ import annotations
@@ -93,7 +107,20 @@ def parse_args() -> argparse.Namespace:
                    help="Where the baseline seed_{N}/model.pt live. "
                         "Defaults to code/outputs/baseline/.")
     p.add_argument("--out-dir", default=None,
-                   help="Defaults to code/outputs/compression/.")
+                   help="Defaults to code/outputs/compression/ (single split) "
+                        "or code/outputs/compression_cv/ (--cv).")
+
+    # --- CV mode: compress per fold against the cross-validation checkpoints ---
+    p.add_argument("--cv", action="store_true",
+                   help="Run per-fold against the CV checkpoints produced by "
+                        "scripts.train_cv. Reads --cv-dir/cv_summary.json, "
+                        "rebuilds each fold's split, loads "
+                        "fold_k/seed_S/model.pt, and evaluates compression on "
+                        "that fold's own test set. Aggregates across folds x "
+                        "seeds, so deltas carry subject-variation error bars.")
+    p.add_argument("--cv-dir", default=None,
+                   help="Where the CV outputs live (cv_summary.json + "
+                        "fold_k/seed_S/model.pt). Defaults to code/outputs/cv/.")
     p.add_argument("--quick", action="store_true",
                    help="Tiny wiring check: 1 seed, sparsities 0.5 0.9, "
                         "trimmed split, fewer calib batches.")
@@ -136,6 +163,8 @@ def load_baseline(ckpt_path: Path, device: str) -> tuple[BaselineCNN, dict]:
         in_channels=arch["in_channels"],
         num_classes=arch["num_classes"],
         dropout=arch["dropout"],
+        width_mult=arch.get("width_mult", 1.0),
+        conv_dropout=arch.get("conv_dropout", 0.0),
     )
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
@@ -249,13 +278,19 @@ def per_class_acc_map(record: dict) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 
-def run_seed(
-    seed: int, args: argparse.Namespace,
+def compress_checkpoint(
+    ckpt_path: Path, args: argparse.Namespace,
     val_ds: CombinedRadarDataset, test_ds: CombinedRadarDataset,
-    baseline_dir: Path, out_dir: Path,
 ) -> dict:
+    """Load one baseline checkpoint, build every compressed variant, evaluate.
+
+    Returns the ``configs`` dict (baseline + prune sweep + INT8 + combined),
+    each entry holding overall / per-campaign / per-class accuracy on
+    ``test_ds``. Calibration for INT8 PTQ uses ``val_ds``. This is the shared
+    core used by both the single-split path (``run_seed``) and the CV path
+    (``run_cv``).
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpt_path = baseline_dir / f"seed_{seed}" / "model.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Missing baseline checkpoint: {ckpt_path}")
 
@@ -319,6 +354,17 @@ def run_seed(
                       f"C1macro={rec['c1_macro_acc']:.3f}  "
                       f"C2macro={rec['c2_macro_acc']:.3f}", flush=True)
 
+    return configs
+
+
+def run_seed(
+    seed: int, args: argparse.Namespace,
+    val_ds: CombinedRadarDataset, test_ds: CombinedRadarDataset,
+    baseline_dir: Path, out_dir: Path,
+) -> dict:
+    """Single-split path: compress the seed_{seed} baseline checkpoint."""
+    ckpt_path = baseline_dir / f"seed_{seed}" / "model.pt"
+    configs = compress_checkpoint(ckpt_path, args, val_ds, test_ds)
     seed_dir = out_dir / f"seed_{seed}"
     seed_dir.mkdir(parents=True, exist_ok=True)
     (seed_dir / "results.json").write_text(
@@ -327,16 +373,86 @@ def run_seed(
     return configs
 
 
+def run_cv(args: argparse.Namespace, cfg: PipelineConfig, out_dir: Path) -> None:
+    """CV path: compress each fold's checkpoint, evaluate on that fold's test.
+
+    Reads ``--cv-dir/cv_summary.json`` (written by ``scripts.train_cv``) for the
+    fold definitions and the list of seeds, then for every (fold, seed) loads
+    ``fold_k/seed_S/model.pt`` and runs the same compression grid as the
+    single-split path. All (fold x seed) runs are aggregated together, so the
+    per-class deltas carry the same subject-variation error bars as the CV
+    baseline.
+    """
+    cv_dir = Path(args.cv_dir) if args.cv_dir else (
+        Path(__file__).resolve().parents[1] / "outputs" / "cv")
+    summary_path = cv_dir / "cv_summary.json"
+    if not summary_path.exists():
+        raise FileNotFoundError(
+            f"No cv_summary.json at {summary_path}. Run scripts.train_cv first.")
+    cv = json.loads(summary_path.read_text())
+    seeds = list(cv.get("seeds", [42]))
+    folds = list(cv["folds"])
+    cv_seed = int(cv.get("cv_seed", 42))
+
+    if args.quick:
+        folds = folds[:1]
+        seeds = seeds[:1]
+        args.sparsities = [0.5, 0.9]
+        args.calib_batches = 4
+        print("  (quick CV mode: fold 0 only, 1 seed, sparsities 0.5 0.9)")
+
+    print(f"Device:     {'cuda' if torch.cuda.is_available() else 'cpu'} "
+          f"(quant always CPU)")
+    print(f"CV dir:     {cv_dir}")
+    print(f"Folds:      {[f['fold'] for f in folds]}   Seeds: {seeds}")
+    print(f"Sparsities: {args.sparsities}")
+    print(f"Quant:      {'skipped' if args.skip_quant else 'INT8 static PTQ'}")
+
+    runs: dict[str, dict] = {}
+    for fold_rec in folds:
+        k = fold_rec["fold"]
+        split = Split(
+            train=tuple(fold_rec["train"]), val=tuple(fold_rec["val"]),
+            test=tuple(fold_rec["test"]), campaigns=cfg.campaigns, seed=cv_seed,
+        )
+        print(f"\n{'='*70}\nFOLD {k}  "
+              f"(val={len(split.val)} calib, test={len(split.test)})\n{'='*70}")
+        val_ds, test_ds = build_eval_datasets(split, cfg)
+        for seed in seeds:
+            ckpt = cv_dir / f"fold_{k}" / f"seed_{seed}" / "model.pt"
+            print(f"\n-- fold {k} / seed {seed}  ({ckpt})", flush=True)
+            configs = compress_checkpoint(ckpt, args, val_ds, test_ds)
+            fs_dir = out_dir / f"fold_{k}" / f"seed_{seed}"
+            fs_dir.mkdir(parents=True, exist_ok=True)
+            (fs_dir / "results.json").write_text(
+                json.dumps({"fold": k, "seed": seed, "configs": configs}, indent=2))
+            runs[f"fold{k}_seed{seed}"] = configs
+
+    aggregate(runs, out_dir)
+    print("\nCV compression sweep complete.")
+
+
 # ---------------------------------------------------------------------------
 # Cross-seed aggregation
 # ---------------------------------------------------------------------------
 
 
-def aggregate(all_seed_configs: dict[int, dict], out_dir: Path) -> None:
-    """Aggregate across seeds: per-config overall + per-class median ± std,
-    plus delta versus the baseline config."""
+def aggregate(all_seed_configs: dict, out_dir: Path) -> None:
+    """Aggregate across runs: per-config overall + per-class median ± std,
+    plus delta versus the baseline config.
+
+    A "run" is a seed (single-split path) or a fold x seed pair (CV path); the
+    keys of ``all_seed_configs`` identify them. Because every run contains both
+    a ``baseline`` config and the compressed configs, ``delta_vs_baseline``
+    (mean compressed minus mean baseline) equals the mean within-run delta by
+    linearity, and the per-class std spans whatever the runs vary over (seeds,
+    or subjects+seeds under CV)."""
     config_names = list(next(iter(all_seed_configs.values())).keys())
-    summary: dict = {"seeds": list(all_seed_configs.keys()), "configs": {}}
+    summary: dict = {
+        "runs": [str(k) for k in all_seed_configs.keys()],
+        "n_runs": len(all_seed_configs),
+        "configs": {},
+    }
 
     # Baseline per-class means (across seeds) for delta computation.
     base_pc_means: dict[str, float] = defaultdict(list)
@@ -454,6 +570,20 @@ def _plot_degradation(summary: dict, out_path: Path) -> None:
 def main() -> None:
     args = parse_args()
     cfg = DEFAULT_CONFIG
+
+    # ------------------------------------------------------------------
+    # CV path: compress per fold against the cross-validation checkpoints.
+    # ------------------------------------------------------------------
+    if args.cv:
+        out_dir = Path(args.out_dir) if args.out_dir else (
+            Path(__file__).resolve().parents[1] / "outputs" / "compression_cv")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        run_cv(args, cfg, out_dir)
+        return
+
+    # ------------------------------------------------------------------
+    # Single-split path (original behaviour).
+    # ------------------------------------------------------------------
     split = load_split()
 
     class_filter = rep_filter = None
